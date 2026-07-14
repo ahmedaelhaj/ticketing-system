@@ -19,30 +19,14 @@ closer-accountability leaderboard, and in-app notifications.
 
 ## 2. Architecture
 
-```
-                        ┌────────────┐
-   Browser  ───────────▶│   nginx    │  reverse proxy (port 8080)
-                        └─────┬──────┘
-                   ┌──────────┴──────────┐
-                   ▼                     ▼
-            ┌─────────────┐      ┌──────────────┐
-            │  frontend   │      │   backend    │  FastAPI (JWT auth)
-            │ React+Vite  │      │              │
-            │ served by   │      └──────┬───────┘
-            │ its own     │             │
-            │ nginx       │      ┌──────┴───────┐
-            └─────────────┘      ▼              ▼
-                          ┌────────────┐  ┌────────────┐
-                          │ PostgreSQL │  │   Redis    │
-                          └────────────┘  └──────┬─────┘
-                                                   │
-                                          ┌────────┴────────┐
-                                          ▼                 ▼
-                                  ┌──────────────┐  ┌──────────────┐
-                                  │celery_worker │  │ celery_beat  │
-                                  │ (background  │  │ (scheduled   │
-                                  │  jobs)       │  │  SLA checks) │
-                                  └──────────────┘  └──────────────┘
+```mermaid
+flowchart TD
+    Browser["Client browser"] --> Nginx["nginx reverse proxy<br/>port 8080"]
+    Nginx --> Frontend["frontend — React SPA<br/>served by its own nginx"]
+    Nginx --> Backend["backend — FastAPI<br/>auth, tickets, reports, uploads"]
+    Backend --> Postgres[("PostgreSQL<br/>tickets, approvals, notifications")]
+    Backend --> Redis[("Redis<br/>cache + Celery broker")]
+    Redis --> Celery["celery_worker + celery_beat<br/>reports, SLA checks every 6h"]
 ```
 
 | Container | Role |
@@ -66,6 +50,90 @@ persisted).
 ---
 
 ## 3. Data Model (core tables)
+
+```mermaid
+erDiagram
+    TEAMS ||--o{ USERS : "has members"
+    USERS ||--o{ TICKETS : creates
+    USERS ||--o{ TICKETS : "assigned to"
+    USERS ||--o{ TICKETS : closes
+    TEAMS ||--o{ TICKETS : "current owner"
+    TEAMS ||--o{ TICKETS : "origin (audit)"
+    TICKETS ||--o{ TICKET_STATUS_HISTORY : logs
+    TICKETS ||--o{ APPROVALS : requires
+    USERS ||--o{ APPROVALS : "approver (stage 1/2)"
+    TICKETS ||--o{ TICKET_COMMENTS : has
+    USERS ||--o{ TICKET_COMMENTS : writes
+    TICKETS ||--o{ ATTACHMENTS : has
+    USERS ||--o{ ATTACHMENTS : uploads
+    USERS ||--o{ NOTIFICATIONS : receives
+    TICKETS ||--o{ NOTIFICATIONS : "linked to"
+
+    TEAMS {
+        uuid id PK
+        string name
+        uuid team_admin_id FK
+        bool is_active
+    }
+    USERS {
+        uuid id PK
+        string email
+        string password_hash
+        string full_name
+        enum role
+        uuid team_id FK
+        bool is_active
+    }
+    TICKETS {
+        uuid id PK
+        string title
+        enum status
+        enum priority
+        uuid created_by FK
+        uuid assigned_to FK
+        uuid team_id FK
+        uuid origin_team_id FK
+        uuid requested_team_id FK
+        uuid closed_by FK
+        timestamp closed_at
+    }
+    APPROVALS {
+        uuid id PK
+        uuid ticket_id FK
+        uuid approver_id FK
+        int stage
+        enum decision
+        text comment
+    }
+    TICKET_STATUS_HISTORY {
+        uuid id PK
+        uuid ticket_id FK
+        enum from_status
+        enum to_status
+        uuid changed_by FK
+        text note
+    }
+    TICKET_COMMENTS {
+        uuid id PK
+        uuid ticket_id FK
+        uuid author_id FK
+        text body
+    }
+    ATTACHMENTS {
+        uuid id PK
+        uuid ticket_id FK
+        uuid uploaded_by FK
+        string filename
+        string storage_path
+    }
+    NOTIFICATIONS {
+        uuid id PK
+        uuid user_id FK
+        uuid ticket_id FK
+        string type
+        bool read
+    }
+```
 
 | Table | Purpose |
 |---|---|
@@ -112,6 +180,17 @@ though they administer their own team. A `super_admin`'s tickets are always auto
 ---
 
 ## 5. Ticket Lifecycle
+
+```mermaid
+flowchart TD
+    Created["Ticket created"] --> Pending["Pending approval<br/>stage 1, then stage 2 if cross-team"]
+    Pending -->|approved| Open["Open"]
+    Pending -->|rejected| Returned["Returned to creator<br/>edit and resubmit"]
+    Returned -.->|resubmit — restarts at stage 1| Pending
+    Open --> InProgress["In progress"]
+    InProgress --> Closed["Closed"]
+    Closed -.->|team admin / super admin only| Open
+```
 
 ### Statuses
 `pending_approval` → `open` → `in_progress` → `closed`, with a `rejected` branch that can
